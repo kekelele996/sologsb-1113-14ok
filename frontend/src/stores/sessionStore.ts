@@ -1,6 +1,7 @@
 import { create } from 'zustand';
 import { db, deleteRow, persistRow, SCHEMA_VERSION } from '../hooks/usePersistentStore';
 import { uid } from '../utils/id';
+import type { AutoPlanResult } from '../utils/scheduler';
 import type { ObsSession, SessionStatus } from '../types';
 
 export interface SessionInput {
@@ -27,6 +28,11 @@ interface SessionState {
   /** 批量改期到备用观测夜并填写改期原因 */
   rescheduleToBackup: (ids: string[], backupNightId: string, reason: string) => Promise<number>;
   updateStatus: (id: string, status: SessionStatus) => Promise<void>;
+  /**
+   * 本夜自动编排落库：删除该夜全部「待执行」段（已完成/进行中/因云取消等保留不动），
+   * 再一次性写入算法排出的整条序列。Dexie 单事务提交，任一步失败整体回滚。
+   */
+  replaceNightPlan: (nightId: string, result: AutoPlanResult) => Promise<{ removed: number; added: number }>;
 }
 
 /** 排程段与冲突检测所需数据 */
@@ -91,5 +97,42 @@ export const useSessionStore = create<SessionState>()((set, get) => ({
 
   updateStatus: async (id, status) => {
     await get().updateSession(id, { status });
+  },
+
+  replaceNightPlan: async (nightId, result) => {
+    const previous = get().sessions;
+    const pendingIds = previous.filter((session) => session.nightId === nightId && session.status === '待执行').map((session) => session.id);
+
+    const created: ObsSession[] = result.planned.map((slot) => ({
+      id: uid('s'),
+      nightId,
+      targetId: slot.targetId,
+      startTime: slot.startTime,
+      endTime: slot.endTime,
+      telescopeId: slot.telescopeId,
+      instrumentId: slot.instrumentId,
+      filterSlot: slot.filterSlot,
+      plannedFrames: slot.plannedFrames,
+      status: '待执行',
+      schemaVersion: SCHEMA_VERSION,
+    }));
+
+    // 先在内存切换（保证冲突统计等订阅者立刻看到新序列）；事务失败时恢复原数组
+    const optimistic = [
+      ...previous.filter((session) => !(session.nightId === nightId && session.status === '待执行')),
+      ...created,
+    ];
+    set({ sessions: optimistic });
+
+    try {
+      await db.transaction('rw', db.sessions, async () => {
+        if (pendingIds.length > 0) await db.sessions.bulkDelete(pendingIds);
+        if (created.length > 0) await db.sessions.bulkPut(created);
+      });
+    } catch (error) {
+      set({ sessions: previous });
+      throw error;
+    }
+    return { removed: pendingIds.length, added: created.length };
   },
 }));

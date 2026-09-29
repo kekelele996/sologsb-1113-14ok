@@ -1,6 +1,7 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import Alert from '@mui/material/Alert';
+import AlertTitle from '@mui/material/AlertTitle';
 import Box from '@mui/material/Box';
 import Button from '@mui/material/Button';
 import Checkbox from '@mui/material/Checkbox';
@@ -31,6 +32,12 @@ import { useTargetStore } from '../stores/targetStore';
 import { useEquipmentStore } from '../stores/equipmentStore';
 import { FILTER_NAMES, SESSION_STATUSES, type SessionStatus } from '../types';
 import { axisMinutes, durationMinutes, formatMinutes } from '../utils/astro';
+import {
+  autoPlanNight,
+  buildSignature,
+  toPlanInput,
+  type AutoPlanResult,
+} from '../utils/scheduler';
 
 interface SessionFormState {
   nightId: string;
@@ -53,6 +60,7 @@ export default function SessionsPage() {
   const updateSession = useSessionStore((s) => s.updateSession);
   const removeSession = useSessionStore((s) => s.removeSession);
   const rescheduleToBackup = useSessionStore((s) => s.rescheduleToBackup);
+  const replaceNightPlan = useSessionStore((s) => s.replaceNightPlan);
   const nights = useNightStore((s) => s.nights);
   const targets = useTargetStore((s) => s.targets);
   const telescopes = useEquipmentStore((s) => s.telescopes);
@@ -89,6 +97,23 @@ export default function SessionsPage() {
 
   const conflictSet = useMemo(() => conflictIds(), [conflictIds]);
   const backupNights = useMemo(() => nights.filter((night) => night.backup), [nights]);
+
+  /** 本夜编排卡片状态 */
+  const [planNightId, setPlanNightId] = useState(
+    nights.find((night) => night.primary)?.id ?? nights[0]?.id ?? '',
+  );
+  const [planning, setPlanning] = useState(false);
+  const [planResult, setPlanResult] = useState<AutoPlanResult | null>(null);
+  /** 最近一次成功编排使用的输入签名（按观测夜区分）：输入不变时重复点击直接跳过、不重排 */
+  const lastSignatureRef = useRef<Map<string, string>>(new Map());
+
+  /** 数据 hydrate 完成或当前所选夜被删除后，回落到主夜 / 第一夜 */
+  useEffect(() => {
+    if (nights.length === 0) return;
+    if (!nights.some((night) => night.id === planNightId)) {
+      setPlanNightId(nights.find((night) => night.primary)?.id ?? nights[0].id);
+    }
+  }, [nights, planNightId]);
 
   const visible = useMemo(() => {
     return [...sessions]
@@ -193,6 +218,38 @@ export default function SessionsPage() {
     setRescheduleReason('');
   }
 
+  /** 一键编排本夜：幂等（输入签名不变不重排），整序列单事务落库，失败回滚并提示 */
+  async function runAutoPlan() {
+    const night = nights.find((item) => item.id === planNightId);
+    if (!night) {
+      setError('请先选择要编排的观测夜');
+      return;
+    }
+    const input = toPlanInput(night, targets, telescopes, instruments, sessions);
+    const signature = buildSignature(input);
+    if (lastSignatureRef.current.get(night.id) === signature) {
+      setNotice('编排输入未变化（目标 / 设备 / 已排定段一致），已跳过，未重复重排');
+      return;
+    }
+    setPlanning(true);
+    setError('');
+    try {
+      const result = autoPlanNight(input);
+      const { removed, added } = await replaceNightPlan(night.id, result);
+      lastSignatureRef.current.set(night.id, signature);
+      setPlanResult(result);
+      setNightFilter(night.id);
+      const switched = result.planned.filter((slot) => slot.narrowbandSwitched).length;
+      const switchText = switched ? `，其中 ${switched} 个暗目标因月相 ${night.moonPhasePct}% 改窄带 Ha` : '';
+      setNotice(`本夜编排完成：清掉原待执行段 ${removed} 段，新排入 ${added} 段，${result.unscheduled.length} 个目标未排进${switchText}`);
+    } catch (reason) {
+      lastSignatureRef.current.delete(night.id);
+      setError(`本夜编排写入失败，已恢复原样：${reason instanceof Error ? reason.message : String(reason)}`);
+    } finally {
+      setPlanning(false);
+    }
+  }
+
   return (
     <Box>
       <Typography variant="h5" sx={{ mb: 0.5 }}>
@@ -240,6 +297,99 @@ export default function SessionsPage() {
         </Button>
         <Chip size="small" label={`命中 ${visible.length} / ${sessions.length}`} />
       </Stack>
+
+      <Paper variant="outlined" sx={{ p: 2, mb: 2, bgcolor: 'grey.50' }}>
+        <Typography variant="subtitle1" sx={{ mb: 0.5 }}>
+          本夜自动编排
+        </Typography>
+        <Typography variant="body2" color="text.secondary" sx={{ mb: 1.5 }}>
+          按目标最低高度与当晚可见窗口排成不撞车序列：维护中 / 外出的镜子不参与；优先 P1，再排窗口快结束的；月相偏亮（≥60%）时暗目标（≥8 等）自动改窄带 Ha。
+          整条序列一次写入，已完成 / 进行中段落保留为固定占用；失败自动恢复原样，重复点击且输入未变不重排。
+        </Typography>
+        <Stack direction="row" spacing={2} alignItems="center" flexWrap="wrap">
+          <TextField
+            select
+            size="small"
+            label="编排观测夜"
+            value={planNightId}
+            onChange={(event) => {
+              setPlanNightId(event.target.value);
+              setPlanResult((current) => (current && current.nightId === event.target.value ? current : null));
+            }}
+            sx={{ minWidth: 280 }}
+          >
+            {nights.map((night) => (
+              <MenuItem key={night.id} value={night.id}>
+                {`${night.date} · ${night.siteName} · 月相 ${night.moonPhasePct}%${night.primary ? '（主夜）' : night.backup ? '（备用夜）' : ''}`}
+              </MenuItem>
+            ))}
+          </TextField>
+          <Button variant="contained" color="primary" disabled={planning || !planNightId} onClick={() => void runAutoPlan()}>
+            {planning ? '编排中…' : '一键编排本夜'}
+          </Button>
+          {(() => {
+            const count = telescopes.filter((telescope) => telescope.status === '可用').length;
+            return (
+              <Chip
+                size="small"
+                variant="outlined"
+                label={`可用镜 ${count} / ${telescopes.length}（维护中 / 外出不参与）`}
+                color={count === 0 ? 'error' : 'default'}
+              />
+            );
+          })()}
+          {planResult && planResult.nightId === planNightId ? (
+            <Chip size="small" color="success" variant="outlined" label={`上次编排：排入 ${planResult.planned.length} 段 · 未排入 ${planResult.unscheduled.length} 个`} />
+          ) : null}
+        </Stack>
+
+        {planResult && planResult.nightId === planNightId ? (
+          <Box sx={{ mt: 2 }}>
+            {planResult.planned.some((slot) => slot.narrowbandSwitched) ? (
+              <Alert severity="info" sx={{ mb: 1.5 }}>
+                {nightById(planResult.nightId)?.moonPhasePct ?? ''}% 月相偏亮，以下暗目标已改用窄带 Ha：
+                {planResult.planned
+                  .filter((slot) => slot.narrowbandSwitched)
+                  .map((slot) => ` ${targetById(slot.targetId)?.name ?? slot.targetId}（${slot.startTime}-${slot.endTime}）`)
+                  .join('；')}
+              </Alert>
+            ) : null}
+            {planResult.unscheduled.length > 0 ? (
+              <Alert severity="warning" icon={false}>
+                <AlertTitle>{planResult.unscheduled.length} 个目标本夜排不进去</AlertTitle>
+                <TableContainer sx={{ bgcolor: 'transparent' }}>
+                  <Table size="small">
+                    <TableHead>
+                      <TableRow>
+                        <TableCell>目标</TableCell>
+                        <TableCell>优先级</TableCell>
+                        <TableCell>可见窗口 / 最高高度</TableCell>
+                        <TableCell>未排入原因</TableCell>
+                      </TableRow>
+                    </TableHead>
+                    <TableBody>
+                      {planResult.unscheduled.map((item) => (
+                        <TableRow key={item.targetId}>
+                          <TableCell>{item.name}</TableCell>
+                          <TableCell>
+                            <Chip size="small" label={item.priority} color={item.priority === 'P1' ? 'error' : item.priority === 'P2' ? 'warning' : 'default'} />
+                          </TableCell>
+                          <TableCell>{item.windowText ? `${item.windowText} · 最高 ${item.maxAltitude}°` : '整夜不可见'}</TableCell>
+                          <TableCell>{item.reason}</TableCell>
+                        </TableRow>
+                      ))}
+                    </TableBody>
+                  </Table>
+                </TableContainer>
+              </Alert>
+            ) : (
+              <Alert severity="success" sx={{ mt: 1 }}>
+                全部候选目标均已排入，无撞车
+              </Alert>
+            )}
+          </Box>
+        ) : null}
+      </Paper>
 
       <TableContainer component={Paper} variant="outlined">
         <Table size="small">

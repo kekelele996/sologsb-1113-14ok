@@ -42,6 +42,19 @@ export function axisMinutes(hhmm: string): number {
   return clock >= NIGHT_START_MINUTES ? clock - NIGHT_START_MINUTES : clock + (1440 - NIGHT_START_MINUTES);
 }
 
+/**
+ * 'HH:mm' → 相对当日 18:00 的分钟刻度（允许负值）：
+ * 18:00~23:59 为当日傍晚（0 起），12:00~17:59 为傍晚前（负值，如 17:42 → -18），
+ * 00:00~11:59 为次日凌晨（+1440）。日落可能早于 18:00，排程采样需用本函数而非 axisMinutes。
+ */
+export function nightAxisMinutes(hhmm: string): number {
+  const [h, m] = hhmm.split(':').map((v) => Number(v) || 0);
+  const clock = h * 60 + m;
+  if (clock >= NIGHT_START_MINUTES) return clock - NIGHT_START_MINUTES;
+  if (clock >= 12 * 60) return clock - NIGHT_START_MINUTES;
+  return clock + (1440 - NIGHT_START_MINUTES);
+}
+
 /** 时间轴刻度 → 'HH:mm' */
 export function minutesToTime(axis: number): string {
   const total = ((NIGHT_START_MINUTES + axis) % 1440 + 1440) % 1440;
@@ -94,8 +107,9 @@ export interface VisibilityWindow {
  */
 export function visibilityWindow(target: ObsTarget, night: ObsNight, stepMinutes = 10): VisibilityWindow | null {
   const base = new Date(`${night.date}T18:00:00`);
-  const from = axisMinutes(night.sunset);
-  const to = axisMinutes(night.sunrise) || NIGHT_TOTAL_MINUTES;
+  // 日落可能略早于 18:00（负刻度），时间轴只展示 18:00 起，故下界截到 0；日出按夜轴换算（通常在 0~720）
+  const from = Math.max(0, nightAxisMinutes(night.sunset));
+  const to = Math.max(from, Math.min(NIGHT_TOTAL_MINUTES, nightAxisMinutes(night.sunrise)));
   const samples: Array<{ axis: number; altitude: number }> = [];
   for (let axis = from; axis <= to; axis += stepMinutes) {
     const date = new Date(base.getTime() + axis * 60_000);
@@ -104,7 +118,7 @@ export function visibilityWindow(target: ObsTarget, night: ObsNight, stepMinutes
   const visible = samples.filter((sample) => sample.altitude >= target.minAltitude);
   if (visible.length === 0) return null;
   const startAxis = visible[0].axis;
-  const endAxis = visible[visible.length - 1].axis + stepMinutes;
+  const endAxis = Math.min(to, visible[visible.length - 1].axis + stepMinutes);
   return {
     startText: minutesToTime(startAxis),
     endText: minutesToTime(endAxis),
