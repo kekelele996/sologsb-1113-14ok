@@ -9,6 +9,10 @@ import Dialog from '@mui/material/Dialog';
 import DialogActions from '@mui/material/DialogActions';
 import DialogContent from '@mui/material/DialogContent';
 import DialogTitle from '@mui/material/DialogTitle';
+import Divider from '@mui/material/Divider';
+import List from '@mui/material/List';
+import ListItem from '@mui/material/ListItem';
+import ListItemText from '@mui/material/ListItemText';
 import MenuItem from '@mui/material/MenuItem';
 import Paper from '@mui/material/Paper';
 import Stack from '@mui/material/Stack';
@@ -31,6 +35,7 @@ import { useTargetStore } from '../stores/targetStore';
 import { useEquipmentStore } from '../stores/equipmentStore';
 import { FILTER_NAMES, SESSION_STATUSES, type SessionStatus } from '../types';
 import { axisMinutes, durationMinutes, formatMinutes } from '../utils/astro';
+import { buildNightSchedule, scheduleItemsToSessions } from '../utils/scheduler';
 
 interface SessionFormState {
   nightId: string;
@@ -50,10 +55,12 @@ export default function SessionsPage() {
   usePersistentStore();
   const sessions = useSessionStore((s) => s.sessions);
   const addSession = useSessionStore((s) => s.addSession);
+  const addSessionsBatch = useSessionStore((s) => s.addSessionsBatch);
   const updateSession = useSessionStore((s) => s.updateSession);
   const removeSession = useSessionStore((s) => s.removeSession);
   const rescheduleToBackup = useSessionStore((s) => s.rescheduleToBackup);
   const nights = useNightStore((s) => s.nights);
+  const currentNightId = useNightStore((s) => s.currentNightId);
   const targets = useTargetStore((s) => s.targets);
   const telescopes = useEquipmentStore((s) => s.telescopes);
   const instruments = useEquipmentStore((s) => s.instruments);
@@ -74,6 +81,10 @@ export default function SessionsPage() {
   const [rescheduleOpen, setRescheduleOpen] = useState(false);
   const [rescheduleNight, setRescheduleNight] = useState('');
   const [rescheduleReason, setRescheduleReason] = useState('');
+  const [scheduleOpen, setScheduleOpen] = useState(false);
+  const [scheduleNightId, setScheduleNightId] = useState('');
+  const [scheduling, setScheduling] = useState(false);
+  const [scheduleError, setScheduleError] = useState('');
   const [form, setForm] = useState<SessionFormState>({
     nightId: '',
     targetId: '',
@@ -116,6 +127,35 @@ export default function SessionsPage() {
       ignoreSessionId: editingId || undefined,
     });
   }, [dialogOpen, findConflicts, form.nightId, form.telescopeId, form.startTime, form.endTime, editingId]);
+
+  const scheduleNight = nights.find((night) => night.id === scheduleNightId);
+  const scheduleResult = useMemo(() => {
+    if (!scheduleOpen || !scheduleNight) return null;
+    return buildNightSchedule(scheduleNight, targets, telescopes, instruments, sessions);
+  }, [scheduleOpen, scheduleNight, targets, telescopes, instruments, sessions]);
+
+  function openSchedule() {
+    const fallback = nights.find((night) => night.primary) ?? nights[0];
+    setScheduleNightId(nightFilter !== '全部' ? nightFilter : currentNightId || fallback?.id || '');
+    setScheduleError('');
+    setScheduleOpen(true);
+  }
+
+  async function confirmSchedule() {
+    if (!scheduleNight || !scheduleResult || scheduleResult.items.length === 0) return;
+    setScheduling(true);
+    setScheduleError('');
+    try {
+      const inputs = scheduleItemsToSessions(scheduleNight.id, scheduleResult.items);
+      const created = await addSessionsBatch(inputs);
+      setNotice(`本夜编排完成：已写入 ${created.length} 段排程，未排入 ${scheduleResult.failures.length} 个目标`);
+      setScheduleOpen(false);
+    } catch (reason) {
+      setScheduleError(`写入失败，已恢复原样：${(reason as Error).message}`);
+    } finally {
+      setScheduling(false);
+    }
+  }
 
   function openCreate() {
     setEditingId('');
@@ -217,6 +257,9 @@ export default function SessionsPage() {
       <Stack direction="row" spacing={2} sx={{ mb: 2, flexWrap: 'wrap' }} alignItems="center">
         <Button variant="contained" onClick={openCreate}>
           新增排程段
+        </Button>
+        <Button variant="contained" color="secondary" onClick={openSchedule} disabled={scheduling}>
+          本夜编排
         </Button>
         <Button variant="outlined" color="warning" disabled={selected.length === 0} onClick={() => setRescheduleOpen(true)}>
           批量改期到备用夜（已选 {selected.length}）
@@ -463,6 +506,105 @@ export default function SessionsPage() {
           <Button onClick={() => setRescheduleOpen(false)}>取消</Button>
           <Button variant="contained" color="warning" onClick={() => void submitReschedule()}>
             确认改期
+          </Button>
+        </DialogActions>
+      </Dialog>
+
+      <Dialog open={scheduleOpen} onClose={() => setScheduleOpen(false)} maxWidth="md" fullWidth>
+        <DialogTitle>本夜编排</DialogTitle>
+        <DialogContent>
+          {scheduleError ? (
+            <Alert severity="error" sx={{ mb: 1.5 }}>
+              {scheduleError}
+            </Alert>
+          ) : null}
+          <Alert severity="info" sx={{ mb: 1.5 }}>
+            按目标最低高度与当晚可见窗口，把待观测目标排成一条不撞车的序列；维护中或外出的望远镜不参与，优先排 P1 再排窗口快结束的，月相偏亮时暗目标改用窄带滤镜。整条序列一次写入，失败自动恢复原样。
+          </Alert>
+          <FieldRow label="编排观测夜" required>
+            <TextField select size="small" fullWidth value={scheduleNightId} onChange={(event) => setScheduleNightId(event.target.value)}>
+              {nights.map((night) => (
+                <MenuItem key={night.id} value={night.id}>
+                  {`${night.date} · ${night.siteName} · 月相 ${night.moonPhasePct}%（${night.cloudText}）${night.primary ? ' · 主夜' : night.backup ? ' · 备用夜' : ''}`}
+                </MenuItem>
+              ))}
+            </TextField>
+          </FieldRow>
+
+          {scheduleNight ? (
+            <Stack direction="row" spacing={1} sx={{ mb: 1.5, flexWrap: 'wrap' }}>
+              <Chip size="small" label={`可用望远镜 ${telescopes.filter((t) => t.status === '可用').length} / ${telescopes.length}`} color="success" variant="outlined" />
+              <Chip size="small" label={`待观测目标 ${targets.filter((t) => !sessions.some((s) => s.nightId === scheduleNight.id && s.targetId === t.id)).length} 个`} />
+              <Chip size="small" label={`可排入 ${scheduleResult?.items.length ?? 0} 段`} color="primary" />
+              <Chip size="small" label={`未排入 ${scheduleResult?.failures.length ?? 0} 个`} color={scheduleResult?.failures.length ? 'warning' : 'default'} />
+            </Stack>
+          ) : null}
+
+          {scheduleResult && scheduleResult.items.length > 0 ? (
+            <>
+              <Typography variant="subtitle2" sx={{ mt: 1, mb: 0.5 }}>
+                可排入序列（{scheduleResult.items.length} 段）
+              </Typography>
+              <List dense disablePadding>
+                {scheduleResult.items.map((item) => {
+                  const target = targetById(item.targetId);
+                  const telescope = telescopeById(item.telescopeId);
+                  return (
+                    <ListItem key={item.targetId} disableGutters sx={{ py: 0.25 }}>
+                      <ListItemText
+                        primary={
+                          <Stack direction="row" spacing={1} alignItems="center" flexWrap="wrap">
+                            <Chip size="small" label={`${item.startTime}-${item.endTime}`} />
+                            <Typography variant="body2">{target?.name ?? '未知目标'}</Typography>
+                            <Chip size="small" variant="outlined" label={`${telescope?.code ?? '-'} / ${item.filterSlot}`} />
+                            {item.changedFilter ? <Chip size="small" color="info" label="月相偏亮改用窄带" /> : null}
+                            <Typography variant="caption" color="text.secondary">
+                              {item.plannedFrames} 帧
+                            </Typography>
+                          </Stack>
+                        }
+                      />
+                    </ListItem>
+                  );
+                })}
+              </List>
+            </>
+          ) : null}
+
+          {scheduleResult && scheduleResult.failures.length > 0 ? (
+            <>
+              <Divider sx={{ my: 1 }} />
+              <Typography variant="subtitle2" sx={{ mb: 0.5 }} color="warning.main">
+                未排入目标（{scheduleResult.failures.length} 个）
+              </Typography>
+              <List dense disablePadding>
+                {scheduleResult.failures.map((failure) => (
+                  <ListItem key={failure.targetId} disableGutters sx={{ py: 0.25 }}>
+                    <ListItemText
+                      primary={<Typography variant="body2">{failure.targetName}</Typography>}
+                      secondary={<Typography variant="caption" color="text.secondary">{failure.reason}</Typography>}
+                    />
+                  </ListItem>
+                ))}
+              </List>
+            </>
+          ) : null}
+
+          {scheduleResult && scheduleResult.items.length === 0 && scheduleResult.failures.length === 0 ? (
+            <Alert severity="success" sx={{ mt: 1 }}>
+              本夜目标均已排程，无需编排。
+            </Alert>
+          ) : null}
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setScheduleOpen(false)}>取消</Button>
+          <Button
+            variant="contained"
+            color="secondary"
+            disabled={scheduling || !scheduleResult || scheduleResult.items.length === 0}
+            onClick={() => void confirmSchedule()}
+          >
+            {scheduling ? '写入中…' : `确认写入（${scheduleResult?.items.length ?? 0} 段）`}
           </Button>
         </DialogActions>
       </Dialog>

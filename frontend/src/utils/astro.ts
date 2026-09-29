@@ -90,26 +90,34 @@ export interface VisibilityWindow {
 
 /**
  * 本地计算目标的可见窗口：从日落到日出每 stepMinutes 采样地平高度角，
- * 取连续满足最小高度阈值的区间。
+ * 取连续满足最小高度阈值的区间。日落可能早于 18:00（时间轴起点），
+ * 直接用日落/日出时刻构造 Date 采样，避免 axisMinutes 跨傍晚误映射。
  */
 export function visibilityWindow(target: ObsTarget, night: ObsNight, stepMinutes = 10): VisibilityWindow | null {
   const base = new Date(`${night.date}T18:00:00`);
-  const from = axisMinutes(night.sunset);
-  const to = axisMinutes(night.sunrise) || NIGHT_TOTAL_MINUTES;
+  const [sh, sm] = (night.sunset || '18:00').split(':').map((v) => Number(v) || 0);
+  const [rh, rm] = (night.sunrise || '06:00').split(':').map((v) => Number(v) || 0);
+  const start = new Date(base);
+  start.setHours(sh, sm, 0, 0);
+  const end = new Date(base);
+  end.setDate(end.getDate() + 1);
+  end.setHours(rh, rm, 0, 0);
   const samples: Array<{ axis: number; altitude: number }> = [];
-  for (let axis = from; axis <= to; axis += stepMinutes) {
-    const date = new Date(base.getTime() + axis * 60_000);
+  for (let t = start.getTime(); t <= end.getTime(); t += stepMinutes * 60_000) {
+    const date = new Date(t);
+    const axis = (date.getTime() - base.getTime()) / 60_000;
     samples.push({ axis, altitude: altitudeAt(target, date, night.siteLat, night.siteLng) });
   }
   const visible = samples.filter((sample) => sample.altitude >= target.minAltitude);
   if (visible.length === 0) return null;
-  const startAxis = visible[0].axis;
-  const endAxis = visible[visible.length - 1].axis + stepMinutes;
+  const startAxis = Math.max(0, visible[0].axis);
+  const endAxis = Math.min(NIGHT_TOTAL_MINUTES, visible[visible.length - 1].axis + stepMinutes);
+  if (endAxis <= startAxis) return null;
   return {
     startText: minutesToTime(startAxis),
     endText: minutesToTime(endAxis),
     maxAltitude: Number(Math.max(...visible.map((sample) => sample.altitude)).toFixed(1)),
-    durationMinutes: endAxis - startAxis,
+    durationMinutes: Math.round(endAxis - startAxis),
   };
 }
 

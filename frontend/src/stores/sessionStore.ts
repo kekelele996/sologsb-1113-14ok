@@ -22,6 +22,7 @@ interface SessionState {
   hydrated: boolean;
   hydrate: () => Promise<void>;
   addSession: (input: SessionInput) => Promise<ObsSession>;
+  addSessionsBatch: (inputs: SessionInput[]) => Promise<ObsSession[]>;
   updateSession: (id: string, patch: Partial<SessionInput>) => Promise<void>;
   removeSession: (id: string) => Promise<void>;
   /** 批量改期到备用观测夜并填写改期原因 */
@@ -58,6 +59,30 @@ export const useSessionStore = create<SessionState>()((set, get) => ({
     await persistRow('sessions', session);
     set({ sessions: [...get().sessions, session] });
     return session;
+  },
+
+  addSessionsBatch: async (inputs) => {
+    const sessions: ObsSession[] = inputs.map((input) => ({
+      id: uid('s'),
+      nightId: input.nightId,
+      targetId: input.targetId,
+      startTime: input.startTime,
+      endTime: input.endTime,
+      telescopeId: input.telescopeId,
+      instrumentId: input.instrumentId,
+      filterSlot: input.filterSlot,
+      plannedFrames: Number(input.plannedFrames) || 0,
+      status: input.status,
+      rescheduleReason: input.rescheduleReason?.trim() || undefined,
+      backupNightId: input.backupNightId,
+      schemaVersion: SCHEMA_VERSION,
+    }));
+    // 整条序列一次写入：事务内任一记录失败则整体回滚，不产生半条编排
+    await db.transaction('rw', db.sessions, async () => {
+      await db.sessions.bulkPut(sessions);
+    });
+    set({ sessions: [...get().sessions, ...sessions] });
+    return sessions;
   },
 
   updateSession: async (id, patch) => {
